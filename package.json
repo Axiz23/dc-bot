@@ -1,0 +1,27 @@
+{
+  "name": "minecraft-discord-bot",
+  "version": "1.0.0",
+  "description": "A Minecraft bot that connects with Discord",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "mineflayer": "^4.14.0",
+    "mineflayer-pathfinder": "^2.4.4",
+    "mineflayer-web-inventory": "^1.8.4",
+    "mineflayer-dashboard": "^1.0.0",
+    "canvas": "^2.11.2",
+    "node-fetch": "^3.3.2",
+    "prismarine-viewer": "^1.25.0",
+    "sharp": "^0.32.6",
+    "fs-extra": "^11.1.1",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
+}

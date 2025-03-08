@@ -1,0 +1,28 @@
+{
+  "Htyyon": {
+    "username": "Htyyon",
+    "server": "minegens.id",
+    "port": "25565",
+    "password": "APALU890",
+    "version": "1.20.1",
+    "channelId": "1347800824029646909",
+    "features": {
+      "autoJump": {
+        "enabled": false,
+        "interval": 3
+      },
+      "autoReconnect": {
+        "enabled": true,
+        "interval": 5
+      },
+      "autoQueue": {
+        "enabled": false,
+        "server": "",
+        "interval": 5
+      },
+      "chatLog": {
+        "enabled": true
+      }
+    }
+  }
+}
