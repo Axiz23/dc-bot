@@ -1,331 +1,586 @@
-// Import package yang diperlukan
 require('dotenv').config();
-const { Client, GatewayIntentBits, Partials, ChannelType, PermissionsBitField } = require('discord.js');
-const mineflayer = require('mineflayer');
 const fs = require('fs');
 const path = require('path');
+const { Client, GatewayIntentBits, PermissionFlagsBits, ChannelType } = require('discord.js');
+const mineflayer = require('mineflayer');
+const { pathfinder, Movements, goals } = require('mineflayer-pathfinder'); // Import pathfinder
+const { GoalNear } = goals;
 
-// Konfigurasi bot
-const TOKEN = process.env.DISCORD_TOKEN; // Token diambil dari .env
-const SERVER_ID = '1347135122457100299';
-const CREATE_BOT_CHANNEL_ID = '1347135601404674049';
-const CATEGORY_CHAT_ID = '1347135122457100301';
-
-// Cek apakah token tersedia
-if (!TOKEN) {
-  console.error('Error: Token tidak ditemukan! Pastikan file .env sudah dibuat dan berisi DISCORD_TOKEN.');
-  process.exit(1);
-}
-
-// Buat client Discord dengan intents yang diperlukan
+// Discord client setup
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildMembers,
-  ],
-  partials: [Partials.Channel, Partials.Message],
+  ]
 });
 
-// Penyimpanan instance bot aktif
-const activeBots = new Map();
-const HISTORY_FILE = path.join(__dirname, 'history_account.json');
+// Configuration
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const SERVER_ID = process.env.SERVER_ID;
+const CATEGORY_ID = process.env.CATEGORY_ID;
+const CREATE_BOT_CHANNEL_ID = process.env.CREATE_BOT_CHANNEL_ID;
 
-// Fungsi untuk memuat bot dari file history
-function loadBotsFromHistory() {
+// Bot storage
+let activeBots = {};
+let botConfigs = {};
+
+// Load saved bots
+function loadSavedBots() {
   try {
-    if (fs.existsSync(HISTORY_FILE)) {
-      return JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
+    if (fs.existsSync('./bots.json')) {
+      const data = fs.readFileSync('./bots.json', 'utf8');
+      botConfigs = JSON.parse(data);
+      console.log('Loaded saved bots:', Object.keys(botConfigs).length);
     }
   } catch (error) {
-    console.error('Error loading history file:', error);
+    console.error('Error loading saved bots:', error);
   }
-  return [];
 }
 
-// Fungsi untuk menyimpan bot ke file history
-function saveBotsToHistory() {
+// Save bot configurations
+function saveBotConfigs() {
   try {
-    const botsToSave = Array.from(activeBots.values()).map(botInfo => ({
-      username: botInfo.username,
-      ip: botInfo.ip,
-      port: botInfo.port,
-      password: botInfo.password,
-      version: botInfo.version,
-      channelId: botInfo.channelId,
-      features: botInfo.features,
-    }));
-
-    fs.writeFileSync(HISTORY_FILE, JSON.stringify(botsToSave, null, 2));
+    fs.writeFileSync('./bots.json', JSON.stringify(botConfigs, null, 2));
   } catch (error) {
-    console.error('Error saving history file:', error);
+    console.error('Error saving bot configs:', error);
   }
 }
 
-// Fungsi untuk membuat bot Minecraft
-async function createMinecraftBot(username, ip, port, password, version, channelId, features = {}) {
-  const botFeatures = {
-    auth: false,
-    aqueue: false,
-    ajump: false,
-    areconnect: true,
-    queueServer: null,
-    ajumpSeconds: 60,
-    ...features,
+// Create Minecraft bot
+function createMinecraftBot(username, server, port = 25565, password = '', version = null, channelId) {
+  // Check if bot already exists
+  if (activeBots[username]) {
+    return { success: false, message: `Bot ${username} is already running` };
+  }
+
+  const options = {
+    host: server,
+    port: parseInt(port),
+    username: username,
+    version: version || null,
+    auth: 'offline'
   };
 
-  const bot = mineflayer.createBot({
-    host: ip,
-    port: parseInt(port),
+  // Create the bot
+  const bot = mineflayer.createBot(options);
+
+  // Load pathfinder plugin
+  bot.loadPlugin(pathfinder);
+
+  // Set up bot configuration
+  const botConfig = {
     username,
+    server,
+    port,
     password,
     version,
-    auth: 'offline',
-    keepAlive: true,
-  });
-
-  const botInfo = { 
-    bot, 
-    username, 
-    ip, 
-    port, 
-    password, 
-    version, 
-    channelId, 
-    features: botFeatures, 
-    isConnected: false, 
-    isInQueue: false,
-    targetServer: ip, // Tambahkan targetServer untuk membedakan server queue dan tujuan
-    messageQueue: [], // Antrian pesan untuk menangani rate limiting
-    processingMessages: false // Flag untuk mengontrol pemrosesan pesan
+    channelId,
+    features: {
+      autoJump: { enabled: false, interval: 3 },
+      autoReconnect: { enabled: true, interval: 5 },
+      autoQueue: { enabled: false, server: '', interval: 5 },
+      chatLog: { enabled: true }
+    },
+    currentServer: '' // Menyimpan server saat ini
   };
-  
-  activeBots.set(channelId, botInfo);
-  setupBotEvents(botInfo);
-  return botInfo;
-}
 
-// Fungsi untuk memproses pesan dari antrian dengan delay
-async function processMessageQueue(botInfo) {
-  if (botInfo.processingMessages || botInfo.messageQueue.length === 0) return;
-  
-  botInfo.processingMessages = true;
-  
-  try {
-    const channel = await client.channels.fetch(botInfo.channelId);
-    
-    while (botInfo.messageQueue.length > 0) {
-      const message = botInfo.messageQueue.shift();
-      await channel.send(`${message}`);
-      
-      // Delay antara pengiriman pesan (100ms)
-      await new Promise(resolve => setTimeout(resolve, 100));
-    }
-  } catch (error) {
-    console.error('Error processing message queue:', error);
-  } finally {
-    botInfo.processingMessages = false;
-  }
-}
+  // Save bot config
+  botConfigs[username] = botConfig;
+  saveBotConfigs();
 
-// Fungsi untuk menjalankan auto queue
-function handleAutoQueue(botInfo) {
-  if (!botInfo.features.aqueue || !botInfo.features.queueServer) return;
-  
-  const { bot, channelId } = botInfo;
-  
-  setTimeout(async () => {
-    try {
-      const channel = await client.channels.fetch(channelId);
-      channel.send(`🔄 Menjalankan auto queue...`);
-      bot.chat('/queue main');
-    } catch (error) {
-      console.error('Error saat menjalankan auto queue:', error);
-    }
-  }, 2000); // Tunggu 2 detik setelah masuk server queue baru jalankan perintah
-}
+  // Store active bot
+  activeBots[username] = {
+    bot,
+    config: botConfig,
+    timers: {}
+  };
 
-// Fungsi untuk menangani event bot Minecraft
-function setupBotEvents(botInfo) {
-  const { bot, channelId } = botInfo;
+  // Set up bot event handlers
+  setupBotEventHandlers(username);
 
-  bot.on('login', async () => {
-    botInfo.isConnected = true;
-    const channel = await client.channels.fetch(channelId);
-    channel.send(`Bot **${botInfo.username}** terhubung ke ${botInfo.ip}:${botInfo.port}`);
-    
-    // Jalankan auto queue jika fitur aktif dan ini adalah server queue
-    if (botInfo.features.aqueue && botInfo.features.queueServer && botInfo.ip === botInfo.features.queueServer) {
-      botInfo.isInQueue = true;
-      handleAutoQueue(botInfo);
-    }
-  });
-
-  bot.on('end', async (reason) => {
-    botInfo.isConnected = false;
-    const channel = await client.channels.fetch(channelId);
-    channel.send(`Bot terputus: ${reason}`);
-
-    if (botInfo.features.areconnect) {
-      channel.send('Mencoba untuk menyambungkan ulang dalam 5 detik...');
-      setTimeout(() => reconnectBot(botInfo), 5000);
-    }
-  });
-
-  bot.on('error', async (error) => {
-    const channel = await client.channels.fetch(channelId);
-    channel.send(`Error: ${error.message}`);
-  });
-
-  bot.on('message', async (message) => {
-    const messageStr = message.toString();
-    
-    // Filter pesan yang berisi username bot
-    if (!messageStr.includes(`<${botInfo.username}>`)) {
-      // Deteksi apakah bot telah mencapai target server dari pesan queue
-      if (botInfo.isInQueue && 
-          (messageStr.includes('Connected to the server') || 
-           messageStr.includes('You have been connected to') || 
-           messageStr.includes('Position in queue'))) {
-        
-        // Simpan pesan ke antrian untuk dikirim ke Discord
-        botInfo.messageQueue.push(messageStr);
-        if (!botInfo.processingMessages) {
-          processMessageQueue(botInfo);
-        }
-      } else {
-        // Pesan normal, tambahkan ke antrian
-        botInfo.messageQueue.push(messageStr);
-        if (!botInfo.processingMessages) {
-          processMessageQueue(botInfo);
-        }
-      }
-    }
-  });
-}
-
-// Fungsi untuk menyambungkan ulang bot
-function reconnectBot(botInfo) {
-  try {
-    // Tentukan server yang akan digunakan untuk reconnect (queue jika aqueue aktif, atau server target)
-    const reconnectIp = (botInfo.features.aqueue && botInfo.features.queueServer) ? 
-                         botInfo.features.queueServer : botInfo.ip;
-    const reconnectPort = (botInfo.features.aqueue && botInfo.features.queueServer) ? 
-                           25565 : parseInt(botInfo.port); // Gunakan port default untuk server queue
-
-    const newBot = mineflayer.createBot({
-      host: reconnectIp,
-      port: reconnectPort,
-      username: botInfo.username,
-      password: botInfo.password,
-      version: botInfo.version,
-      auth: 'offline',
-      keepAlive: true,
+  // Handle automatic authentication if password is provided
+  if (password) {
+    bot.once('spawn', () => {
+      setTimeout(() => {
+        bot.chat(`/register ${password} ${password}`);
+        setTimeout(() => {
+          bot.chat(`/login ${password}`);
+        }, 1000);
+      }, 1000);
     });
+  }
 
-    botInfo.bot = newBot;
-    botInfo.isInQueue = botInfo.features.aqueue && reconnectIp === botInfo.features.queueServer;
-    setupBotEvents(botInfo);
-  } catch (error) {
-    console.error('Error saat reconnect:', error);
+  return { success: true, message: `Bot ${username} created and connected to ${server}:${port}` };
+}
+
+// Set up bot event handlers
+function setupBotEventHandlers(username) {
+  const { bot, config, timers } = activeBots[username];
+  const channel = client.channels.cache.get(config.channelId);
+
+  // Message event
+  bot.on('message', (message) => {
+    const messageContent = message.toString().trim(); // Trim whitespace
+
+    // Check if message is not empty and chat log is enabled
+    if (config.features.chatLog.enabled && channel && messageContent) {
+      // Add a 1-second delay before sending the message to Discord
+      setTimeout(() => {
+        channel.send(messageContent);
+      }, 1000); // 1-second delay
+    }
+
+    // Check if bot has joined the target server
+    if (config.features.autoQueue.enabled && config.features.autoQueue.server) {
+      if (
+        message.toString().includes(`You are now playing on ${config.features.autoQueue.server}`) ||
+        message.toString().includes(`Connected to ${config.features.autoQueue.server}`)
+      ) {
+        config.currentServer = config.features.autoQueue.server; // Update current server status
+        saveBotConfigs(); // Save the updated config to bots.json
+
+        if (channel) {
+          channel.send(`Bot **${config.username}** has joined the target server: ${config.features.autoQueue.server}`);
+        }
+      }
+    }
+  });
+
+  // Error event
+  bot.on('error', (error) => {
+    if (channel) {
+      channel.send(`Error: ${error.message}`);
+    }
+    console.error(`Bot ${username} error:`, error);
+  });
+
+  // Kicked event
+  bot.on('kicked', (reason) => {
+    if (channel) {
+      channel.send(`Bot was kicked: ${reason}`);
+    }
+
+    // Reset current server status
+    config.currentServer = '';
+    saveBotConfigs(); // Save the updated config to bots.json
+
+    // Handle reconnection
+    if (config.features.autoReconnect.enabled) {
+      if (channel) {
+        channel.send(`Attempting to reconnect in ${config.features.autoReconnect.interval} seconds...`);
+      }
+
+      // Clear any existing reconnect timer
+      if (timers.reconnect) {
+        clearTimeout(timers.reconnect);
+      }
+
+      // Set reconnect timer
+      timers.reconnect = setTimeout(() => {
+        reconnectBot(username);
+      }, config.features.autoReconnect.interval * 1000);
+    }
+
+    // Run auto queue if bot is kicked and auto queue is enabled
+    if (config.features.autoQueue.enabled && config.features.autoQueue.server) {
+      bot.chat(`/queue ${config.features.autoQueue.server}`);
+    }
+  });
+
+  // Death event (bot dies)
+  bot.on('death', () => {
+    if (channel) {
+      channel.send(`Bot **${config.username}** has died. Respawning...`);
+    }
+
+    // Auto respawn
+    setTimeout(() => {
+      bot.chat('/respawn');
+    }, 2000); // Respawn after 2 seconds
+  });
+
+  // Spawn event (bot successfully joined a server)
+  bot.once('spawn', () => {
+    if (channel) {
+      channel.send(`Bot **${username}** connected to ${config.server}:${config.port}`);
+    }
+
+    // Run auto queue if enabled and bot is not in the target server
+    if (config.features.autoQueue.enabled && config.features.autoQueue.server && config.currentServer !== config.features.autoQueue.server) {
+      bot.chat(`/queue ${config.features.autoQueue.server}`);
+    }
+  });
+
+  // Set up auto jump if enabled
+  setupAutoJump(username);
+
+  // Set up auto queue if enabled
+  setupAutoQueue(username);
+}
+
+// Reconnect bot
+function reconnectBot(username) {
+  if (!botConfigs[username]) return false;
+
+  const config = botConfigs[username];
+  const channel = client.channels.cache.get(config.channelId);
+
+  // Remove existing bot if it exists
+  if (activeBots[username]) {
+    try {
+      activeBots[username].bot.end();
+    } catch (error) {
+      console.error(`Error ending bot ${username}:`, error);
+    }
+
+    // Clear all timers
+    Object.values(activeBots[username].timers).forEach(timer => clearInterval(timer));
+    delete activeBots[username];
+  }
+
+  // Create a new bot with the saved configuration
+  const result = createMinecraftBot(
+    config.username,
+    config.server,
+    config.port,
+    config.password,
+    config.version,
+    config.channelId
+  );
+
+  if (channel && result.message) { // Ensure message is not empty
+    channel.send(result.message);
+  }
+
+  return result.success;
+}
+
+// Set up auto jump feature
+function setupAutoJump(username) {
+  const { bot, config, timers } = activeBots[username];
+
+  // Clear existing timer if there is one
+  if (timers.autoJump) {
+    clearInterval(timers.autoJump);
+    timers.autoJump = null;
+  }
+
+  // Set up new timer if enabled
+  if (config.features.autoJump.enabled) {
+    timers.autoJump = setInterval(() => {
+      if (bot.entity && bot.entity.isValid) { // Ensure the bot entity is valid
+        const defaultMove = new Movements(bot);
+        bot.pathfinder.setMovements(defaultMove);
+
+        // Make the bot jump
+        bot.setControlState('jump', true);
+        setTimeout(() => {
+          bot.setControlState('jump', false);
+        }, 200);
+      }
+    }, config.features.autoJump.interval * 1000);
   }
 }
 
-// Event saat bot Discord siap
-client.once('ready', async () => {
-  console.log(`Bot Discord masuk sebagai ${client.user.tag}`);
+// Set up auto queue feature
+function setupAutoQueue(username) {
+  const { bot, config, timers } = activeBots[username];
 
-  const savedBots = loadBotsFromHistory();
-  for (const botData of savedBots) {
-    try {
-      const channel = await client.channels.fetch(botData.channelId);
-      if (channel) {
-        console.log(`Memulihkan bot: ${botData.username} di ${botData.ip}:${botData.port}`);
-        await createMinecraftBot(botData.username, botData.ip, botData.port, botData.password, botData.version, botData.channelId, botData.features);
+  // Clear existing timer if there is one
+  if (timers.autoQueue) {
+    clearInterval(timers.autoQueue);
+    timers.autoQueue = null;
+  }
+
+  // Set up new timer if enabled
+  if (config.features.autoQueue.enabled && config.features.autoQueue.server) {
+    timers.autoQueue = setInterval(() => {
+      // Only execute /queue if bot is not in the target server
+      if (config.currentServer !== config.features.autoQueue.server) {
+        bot.chat(`/queue ${config.features.autoQueue.server}`);
       }
+    }, config.features.autoQueue.interval * 1000);
+  }
+}
+
+// Disconnect bot
+function disconnectBot(username) {
+  if (!activeBots[username]) {
+    return { success: false, message: `Bot ${username} is not running` };
+  }
+
+  try {
+    // End the bot connection
+    activeBots[username].bot.end();
+
+    // Clear all timers
+    Object.values(activeBots[username].timers).forEach(timer => clearInterval(timer));
+
+    // Remove from active bots
+    delete activeBots[username];
+
+    return { success: true, message: `Bot ${username} has been disconnected` };
+  } catch (error) {
+    console.error(`Error disconnecting bot ${username}:`, error);
+    return { success: false, message: `Error disconnecting bot: ${error.message}` };
+  }
+}
+
+// Discord bot ready handler
+client.once('ready', async () => {
+  console.log(`Logged in as ${client.user.tag}`);
+
+  // Load saved bot configurations
+  loadSavedBots();
+
+  // Connect all saved bots
+  for (const username in botConfigs) {
+    const config = botConfigs[username];
+
+    // Verify channel exists
+    try {
+      const channel = await client.channels.fetch(config.channelId);
+      if (!channel) {
+        console.error(`Channel for bot ${username} not found`);
+        continue;
+      }
+
+      // Start the bot
+      createMinecraftBot(
+        config.username,
+        config.server,
+        config.port,
+        config.password,
+        config.version,
+        config.channelId
+      );
+
+      console.log(`Started bot: ${username}`);
     } catch (error) {
-      console.error(`Gagal memulihkan bot ${botData.username}:`, error);
+      console.error(`Failed to start bot ${username}:`, error);
     }
   }
 });
 
-// Event saat menerima pesan di Discord
+// Message handler
 client.on('messageCreate', async (message) => {
+  // Ignore messages from bots
   if (message.author.bot) return;
 
-  // Handle create bot command
-  if (message.channel.id === CREATE_BOT_CHANNEL_ID && message.content.startsWith('/create')) {
-    const args = message.content.split(' ').slice(1);
-    if (args.length < 5) {
-      return message.reply('Format salah! Gunakan: `/create [username] [ip] [port] [password] [version]`');
-    }
+  // Handle bot creation in the create-bot channel
+  if (message.channelId === CREATE_BOT_CHANNEL_ID) {
+    if (message.content.startsWith('/create')) {
+      const args = message.content.split(' ').slice(1);
 
-    const [username, ip, port, password, version] = args;
-    try {
-      const guild = await client.guilds.fetch(SERVER_ID);
-      const botChannel = await guild.channels.create({
-        name: `${username}-${ip}`.toLowerCase().replace(/[^a-z0-9-]/g, '-'),
-        type: ChannelType.GuildText,
-        parent: CATEGORY_CHAT_ID,
-        permissionOverwrites: [{ id: guild.id, allow: [PermissionsBitField.Flags.ViewChannel] }],
-      });
-
-      await createMinecraftBot(username, ip, port, password, version, botChannel.id);
-      saveBotsToHistory();
-
-      message.reply(`Bot **${username}** dibuat untuk server ${ip}:${port}. Lihat <#${botChannel.id}> untuk berinteraksi.`);
-    } catch (error) {
-      console.error('Gagal membuat bot:', error);
-      message.reply(`Gagal membuat bot: ${error.message}`);
-    }
-  }
-  
-  // Handle commands in bot channels
-  else if (activeBots.has(message.channel.id)) {
-    const botInfo = activeBots.get(message.channel.id);
-    
-    // Perintah untuk mengirim chat ke Minecraft
-    if (message.content.startsWith('/chat ')) {
-      const chatMessage = message.content.slice(6);
-      if (botInfo.isConnected) {
-        botInfo.bot.chat(chatMessage);
-        message.react('✅');
-      } else {
-        message.reply('Bot tidak terhubung ke server!');
+      // Validate arguments
+      if (args.length < 2) {
+        return message.reply('Use /create <Username> <IP Server> <Port> <Password> <Version>');
       }
+
+      const username = args[0];
+      const server = args[1];
+      const port = args[2] || '25565';
+      const password = args[3] || '';
+      const version = args[4] || null;
+
+      // Validate username
+      if (username.length > 16) {
+        return message.reply('Username must be 16 characters or less');
+      }
+
+      // Create channel for the bot
+      try {
+        const guild = message.guild;
+        const category = await client.channels.fetch(CATEGORY_ID);
+
+        if (!category) {
+          return message.reply('Chat category not found');
+        }
+
+        // Create channel
+        const channel = await guild.channels.create({
+          name: `${username}-${server}`,
+          type: ChannelType.GuildText,
+          parent: category.id
+        });
+
+        // Create the Minecraft bot
+        const result = createMinecraftBot(username, server, port, password, version, channel.id);
+
+        if (result.success) {
+          message.reply(`Created Channel For: #${username}-${server}`);
+          channel.send(`Bot ${username} created and connected to ${server}:${port}`);
+        } else {
+          message.reply(result.message);
+          // Delete channel if bot creation failed
+          await channel.delete();
+        }
+      } catch (error) {
+        console.error('Error creating channel:', error);
+        message.reply(`Error creating bot: ${error.message}`);
+      }
+    } else {
+      message.reply('Use /create <Username> <IP Server> <Port> <Password> <Version>');
     }
-    
-    // Perintah untuk mengaktifkan auto queue
-    else if (message.content.startsWith('/setqueue ')) {
-      const queueServer = message.content.slice(10);
-      botInfo.features.aqueue = true;
-      botInfo.features.queueServer = queueServer;
-      saveBotsToHistory();
-      message.reply(`Auto queue diaktifkan dengan server queue: ${queueServer}`);
-    }
-    
-    // Perintah untuk menonaktifkan auto queue
-    else if (message.content === '/disablequeue') {
-      botInfo.features.aqueue = false;
-      saveBotsToHistory();
-      message.reply('Auto queue dinonaktifkan');
-    }
-    
-    // Perintah untuk menyambungkan ulang bot ke server queue
-    else if (message.content === '/joinqueue' && botInfo.features.queueServer) {
-      reconnectBot(botInfo);
-      message.reply(`Bot mencoba tersambung ke server queue: ${botInfo.features.queueServer}`);
-    }
-    
-    // Perintah untuk menyambungkan ulang bot ke server target
-    else if (message.content === '/jointarget') {
-      botInfo.ip = botInfo.targetServer;
-      reconnectBot(botInfo);
-      message.reply(`Bot mencoba tersambung ke server target: ${botInfo.targetServer}:${botInfo.port}`);
+    return;
+  }
+
+  // Handle commands in bot channels
+  for (const username in botConfigs) {
+    const config = botConfigs[username];
+
+    if (message.channelId === config.channelId) {
+      // Feature commands
+      if (message.content.startsWith('/')) {
+        const [command, ...args] = message.content.slice(1).split(' ');
+
+        switch (command) {
+          case 'ajump': {
+            // Auto jump command
+            if (args.length < 1) {
+              return message.reply('Usage: /ajump on/off <seconds>');
+            }
+
+            const enabled = args[0].toLowerCase() === 'on';
+            const interval = args[1] ? parseInt(args[1]) : config.features.autoJump.interval;
+
+            // Update config
+            config.features.autoJump.enabled = enabled;
+            config.features.autoJump.interval = interval;
+
+            // Apply changes
+            if (activeBots[username]) {
+              setupAutoJump(username);
+            }
+
+            // Save config
+            saveBotConfigs();
+
+            message.reply(`Auto jump ${enabled ? 'enabled' : 'disabled'} with interval of ${interval} seconds`);
+            break;
+          }
+
+          case 'areconnect': {
+            // Auto reconnect command
+            if (args.length < 1) {
+              return message.reply('Usage: /areconnect on/off');
+            }
+
+            const enabled = args[0].toLowerCase() === 'on';
+
+            // Update config
+            config.features.autoReconnect.enabled = enabled;
+
+            // Save config
+            saveBotConfigs();
+
+            message.reply(`Auto reconnect ${enabled ? 'enabled' : 'disabled'}`);
+            break;
+          }
+
+          case 'aqueue': {
+            // Auto queue command
+            if (args.length < 1) {
+              return message.reply('Usage: /aqueue on/off <server>');
+            }
+
+            const enabled = args[0].toLowerCase() === 'on';
+            const server = args[1] || config.features.autoQueue.server;
+
+            // Update config
+            config.features.autoQueue.enabled = enabled;
+            if (server) {
+              config.features.autoQueue.server = server;
+            }
+
+            // Apply changes
+            if (activeBots[username]) {
+              setupAutoQueue(username);
+            }
+
+            // Save config
+            saveBotConfigs();
+
+            message.reply(`Auto queue ${enabled ? 'enabled' : 'disabled'}${server ? ` for server ${server}` : ''}`);
+            break;
+          }
+
+          case 'chatlog': {
+            // Chat log command
+            if (args.length < 1) {
+              return message.reply('Usage: /chatlog on/off');
+            }
+
+            const enabled = args[0].toLowerCase() === 'on';
+
+            // Update config
+            config.features.chatLog.enabled = enabled;
+
+            // Save config
+            saveBotConfigs();
+
+            message.reply(`Chat log ${enabled ? 'enabled' : 'disabled'}`);
+            break;
+          }
+
+          case 'disconnect': {
+            // Disconnect command
+            const result = disconnectBot(username);
+            message.reply(result.message);
+            break;
+          }
+
+          case 'connect': {
+            // Connect command
+            const result = reconnectBot(username);
+            if (!result) {
+              message.reply(`Failed to reconnect bot ${username}`);
+            }
+            break;
+          }
+
+          default: {
+            // Forward any other command to Minecraft
+            if (activeBots[username] && activeBots[username].bot.entity) {
+              activeBots[username].bot.chat(`/${command} ${args.join(' ')}`);
+              message.react('✅');
+            } else {
+              message.reply('Bot is not connected');
+            }
+          }
+        }
+      } else {
+        // Regular chat
+        if (activeBots[username] && activeBots[username].bot.entity) {
+          activeBots[username].bot.chat(message.content);
+          message.react('✅');
+        } else {
+          message.reply('Bot is not connected');
+        }
+      }
+
+      return;
     }
   }
 });
 
-client.on('error', console.error);
-client.login(TOKEN);
+// Handle process exit
+process.on('SIGINT', () => {
+  console.log('Shutting down...');
+
+  // Disconnect all bots
+  for (const username in activeBots) {
+    try {
+      activeBots[username].bot.end();
+    } catch (error) {
+      console.error(`Error disconnecting bot ${username}:`, error);
+    }
+  }
+
+  // Exit
+  process.exit(0);
+});
+
+// Login to Discord
+client.login(DISCORD_TOKEN);
